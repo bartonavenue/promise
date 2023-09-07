@@ -1,14 +1,20 @@
 package promise
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 
+	"github.com/panjf2000/ants/v2"
+	conc "github.com/sourcegraph/conc/pool"
 	"github.com/stretchr/testify/require"
 )
 
-var expectedError = errors.New("expected error")
+var (
+	ctx         = context.Background()
+	errExpected = errors.New("expected error")
+)
 
 func TestNew(t *testing.T) {
 	p := New(func(resolve func(any), reject func(error)) {
@@ -17,64 +23,97 @@ func TestNew(t *testing.T) {
 	require.NotNil(t, p)
 }
 
+func TestNewWithPool(t *testing.T) {
+	tests := []struct {
+		name string
+		pool Pool
+	}{
+		{
+			name: "default",
+			pool: newDefaultPool(),
+		},
+		{
+			name: "conc",
+			pool: func() Pool {
+				return FromConcPool(conc.New())
+			}(),
+		},
+		{
+			name: "ants",
+			pool: func() Pool {
+				antsPool, err := ants.NewPool(0)
+				require.NoError(t, err)
+				return FromAntsPool(antsPool)
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			p := NewWithPool(func(resolve func(string), reject func(error)) {
+				resolve(test.name)
+			}, test.pool)
+
+			val, err := p.Await(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, val)
+			require.Equal(t, test.name, *val)
+		})
+	}
+}
+
 func TestPromise_Then(t *testing.T) {
 	p1 := New(func(resolve func(string), reject func(error)) {
 		resolve("Hello, ")
 	})
-	p2 := Then(p1, func(data string) string {
-		return data + "world!"
+	p2 := Then(p1, ctx, func(data string) (string, error) {
+		return data + "world!", nil
+	})
+	p3 := Then(p2, ctx, func(_ string) (string, error) {
+		return "", errExpected
 	})
 
-	val, err := p1.Await()
+	val, err := p1.Await(ctx)
 	require.NoError(t, err)
-	require.Equal(t, "Hello, ", val)
+	require.NotNil(t, val)
+	require.Equal(t, "Hello, ", *val)
 
-	val, err = p2.Await()
+	val, err = p2.Await(ctx)
 	require.NoError(t, err)
-	require.Equal(t, val, "Hello, world!")
+	require.NotNil(t, val)
+	require.Equal(t, "Hello, world!", *val)
+
+	_, err = p3.Await(ctx)
+	require.EqualError(t, err, errExpected.Error())
 }
 
 func TestPromise_Catch(t *testing.T) {
 	p1 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
-	})
-	p2 := Then(p1, func(data any) any {
-		t.Fatal("should not execute Then")
-		return nil
+		reject(errExpected)
 	})
 
-	val, err := p1.Await()
+	val, err := p1.Await(ctx)
 	require.Error(t, err)
-	require.Equal(t, expectedError, err)
+	require.Equal(t, errExpected, err)
 	require.Nil(t, val)
-
-	p2.Await()
 }
 
 func TestPromise_Panic(t *testing.T) {
 	p1 := New(func(resolve func(any), reject func(error)) {
-		panic(nil)
-	})
-	p2 := New(func(resolve func(any), reject func(error)) {
 		panic("random error")
 	})
-	p3 := New(func(resolve func(any), reject func(error)) {
-		panic(expectedError)
+	p2 := New(func(resolve func(any), reject func(error)) {
+		panic(errExpected)
 	})
 
-	val, err := p1.Await()
+	val, err := p1.Await(ctx)
 	require.Error(t, err)
-	require.Equal(t, errors.New("panic recovery: <nil>"), err)
+	require.Equal(t, errors.New("random error"), err)
 	require.Nil(t, val)
 
-	val, err = p2.Await()
+	val, err = p2.Await(ctx)
 	require.Error(t, err)
-	require.Equal(t, errors.New("panic recovery: random error"), err)
-	require.Nil(t, val)
-
-	val, err = p3.Await()
-	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
+	require.ErrorIs(t, err, errExpected)
 	require.Nil(t, val)
 }
 
@@ -89,17 +128,12 @@ func TestAll_Happy(t *testing.T) {
 		resolve("three")
 	})
 
-	p := All(p1, p2, p3)
+	p := All(ctx, p1, p2, p3)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.NoError(t, err)
-	require.Equal(t, []string{"one", "two", "three"}, val)
-}
-
-func TestAll_Empty(t *testing.T) {
-	var empty []*Promise[any]
-	p := All(empty...)
-	require.Nil(t, p)
+	require.NotNil(t, val)
+	require.Equal(t, []string{"one", "two", "three"}, *val)
 }
 
 func TestAll_ContainsRejected(t *testing.T) {
@@ -107,36 +141,36 @@ func TestAll_ContainsRejected(t *testing.T) {
 		resolve("one")
 	})
 	p2 := New(func(resolve func(string), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 	p3 := New(func(resolve func(string), reject func(error)) {
 		resolve("three")
 	})
 
-	p := All(p1, p2, p3)
+	p := All(ctx, p1, p2, p3)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
+	require.ErrorIs(t, err, errExpected)
 	require.Nil(t, val)
 }
 
 func TestAll_OnlyRejected(t *testing.T) {
 	p1 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 	p2 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 	p3 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 
-	p := All(p1, p2, p3)
+	p := All(ctx, p1, p2, p3)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
+	require.ErrorIs(t, err, errExpected)
 	require.Nil(t, val)
 }
 
@@ -150,17 +184,12 @@ func TestRace_Happy(t *testing.T) {
 		resolve("slower")
 	})
 
-	p := Race(p1, p2)
+	p := Race(ctx, p1, p2)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.NoError(t, err)
-	require.Equal(t, "faster", val)
-}
-
-func TestRace_Empty(t *testing.T) {
-	var empty []*Promise[any]
-	p := Race(empty...)
-	require.Nil(t, p)
+	require.NotNil(t, val)
+	require.Equal(t, "faster", *val)
 }
 
 func TestRace_ContainsRejected(t *testing.T) {
@@ -169,71 +198,29 @@ func TestRace_ContainsRejected(t *testing.T) {
 		resolve(nil)
 	})
 	p2 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 
-	p := Race(p1, p2)
+	p := Race(ctx, p1, p2)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
+	require.ErrorIs(t, err, errExpected)
 	require.Nil(t, val)
 }
 
 func TestRace_OnlyRejected(t *testing.T) {
 	p1 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 	p2 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
+		reject(errExpected)
 	})
 
-	p := Race(p1, p2)
+	p := Race(ctx, p1, p2)
 
-	val, err := p.Await()
+	val, err := p.Await(ctx)
 	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
-	require.Nil(t, val)
-}
-
-func TestAny_Happy(t *testing.T) {
-	p1 := New(func(resolve func(string), reject func(error)) {
-		time.Sleep(time.Millisecond * 250)
-		resolve("faster")
-	})
-	p2 := New(func(resolve func(string), reject func(error)) {
-		time.Sleep(time.Millisecond * 500)
-		resolve("slower")
-	})
-	p3 := New(func(resolve func(string), reject func(error)) {
-		reject(expectedError)
-	})
-
-	p := Any(p3, p2, p1)
-
-	val, err := p.Await()
-	require.NoError(t, err)
-	require.Equal(t, "faster", val)
-}
-
-func TestAny_Empty(t *testing.T) {
-	var empty []*Promise[any]
-	p := Any(empty...)
-	require.Nil(t, p)
-}
-
-func TestAny_OnlyRejected(t *testing.T) {
-	p1 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
-	})
-	p2 := New(func(resolve func(any), reject func(error)) {
-		reject(expectedError)
-	})
-
-	p := Any(p1, p2)
-
-	val, err := p.Await()
-	require.Error(t, err)
-	require.ErrorIs(t, err, expectedError)
+	require.ErrorIs(t, err, errExpected)
 	require.Nil(t, val)
 }
